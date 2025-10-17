@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-wallet_gen.py - STEALTH MODE (Mode A)
+wallet_gen.py - STEALTH MODE (Mode A) - 12 Word Phrase Edition
 
-Purpose: Random wallet generation + balance scanning
+Purpose: Random 12-word phrase generation + balance scanning
 Only saves wallets with balance > 0 or transaction history
+
+This script searches for lost/abandoned wallets by generating random
+12-word BIP39 phrases and checking if they have balance.
 
 Features:
 - Load keys from .env (DEBANK_ACCESS_KEY, ALCHEMY_API_KEY)
 - Load config.json, inject ${ALCHEMY_API_KEY}
-- Generate random wallets
+- Generate random 12-word BIP39 phrases
 - Multi-threaded balance checking (DeBank + RPC)
 - Nonce checking (detect used wallets even with 0 balance)
 - Save ONLY wallets with balance or history to hasil.json
@@ -19,6 +22,7 @@ Features:
 import os
 import json
 import time
+import random
 from decimal import Decimal, getcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -33,6 +37,20 @@ except Exception:
     Web3 = None
     HTTPProvider = None
 
+try:
+    from mnemonic import Mnemonic
+    MNEMONIC_AVAILABLE = True
+except Exception:
+    MNEMONIC_AVAILABLE = False
+    print("[!] WARNING: 'mnemonic' library not found!")
+    print("    Install it with: pip install mnemonic")
+
+try:
+    from eth_account.hdaccount import key_from_seed, ETHEREUM_DEFAULT_PATH
+    HDACCOUNT_AVAILABLE = True
+except Exception:
+    HDACCOUNT_AVAILABLE = False
+
 getcontext().prec = 36
 load_dotenv()
 
@@ -45,6 +63,10 @@ DEBANK_BASE_URL = os.getenv("DEBANK_BASE_URL", "https://pro-openapi.debank.com")
 DEBANK_TIMEOUT = int(os.getenv("DEBANK_TIMEOUT", "15"))
 DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() == "true"
 DEFAULT_WORKERS = int(os.getenv("CONCURRENT_WORKERS", "16"))
+
+# BIP39 English Wordlist (2048 words)
+# Loaded once at startup
+BIP39_WORDLIST = None
 
 # ----------------- Global Stats -----------------
 STATS = {
@@ -85,7 +107,7 @@ def print_stats():
     print(f"\n{'='*60}")
     print(f"📊 STATISTICS")
     print(f"{'='*60}")
-    print(f"Generated    : {STATS['total_generated']:,} wallets")
+    print(f"Generated    : {STATS['total_generated']:,} phrases")
     print(f"Checked      : {STATS['total_checked']:,} wallets")
     print(f"Found (💰)   : {STATS['wallets_found']:,} wallets with balance/history")
     print(f"Success Rate : {(STATS['wallets_found']/STATS['total_checked']*100) if STATS['total_checked'] > 0 else 0:.8f}%")
@@ -139,21 +161,120 @@ def build_web3_clients(cfg, timeout=10):
             debug(f"Failed RPC init {chain}: {e}")
     return clients
 
-# ----------------- Wallet generation -----------------
-def create_wallet_random():
-    """Create a completely new random wallet"""
-    acct = Account.create()
-    priv = None
-    if hasattr(acct, "key") and acct.key is not None:
-        try:
-            priv = acct.key.hex()
-        except Exception:
-            priv = getattr(acct, "_private_key", b"").hex()
-    else:
-        priv = getattr(acct, "_private_key", b"").hex()
+# ----------------- BIP39 Wordlist Loading -----------------
+def load_bip39_wordlist():
+    """Load BIP39 English wordlist (2048 words)"""
+    global BIP39_WORDLIST
+    
+    if not MNEMONIC_AVAILABLE:
+        print("[!] ERROR: Cannot load BIP39 wordlist - mnemonic library not installed")
+        return False
+    
+    try:
+        mnemo = Mnemonic("english")
+        BIP39_WORDLIST = mnemo.wordlist
+        print(f"[+] BIP39 wordlist loaded: {len(BIP39_WORDLIST)} words")
+        return True
+    except Exception as e:
+        print(f"[!] Failed to load BIP39 wordlist: {e}")
+        return False
+
+# ----------------- Wallet generation from 12-word phrase -----------------
+def generate_random_12word_phrase():
+    """Generate a random 12-word phrase from BIP39 wordlist"""
+    if not BIP39_WORDLIST:
+        return None
+    
+    # Generate 12 random words from the 2048 word list
+    # Note: This is PURE random, not using proper entropy + checksum
+    # For true BIP39, last word contains checksum, but for brute force we try all combinations
+    words = [random.choice(BIP39_WORDLIST) for _ in range(12)]
+    phrase = " ".join(words)
     
     STATS["total_generated"] += 1
-    return {"address": acct.address, "private_key": priv}
+    return phrase
+
+def validate_and_fix_phrase(phrase):
+    """
+    Try to validate phrase. If invalid checksum, try to fix it.
+    Returns valid phrase or None
+    """
+    if not MNEMONIC_AVAILABLE:
+        return phrase  # Can't validate without mnemonic library
+    
+    try:
+        mnemo = Mnemonic("english")
+        
+        # Check if phrase is valid
+        if mnemo.check(phrase):
+            return phrase
+        
+        # If not valid, try to fix checksum by adjusting last word
+        words = phrase.split()
+        if len(words) != 12:
+            return None
+        
+        # Try different last words until we find valid checksum
+        # (This is brute force on the last word only)
+        for word in BIP39_WORDLIST:
+            test_phrase = " ".join(words[:-1] + [word])
+            if mnemo.check(test_phrase):
+                return test_phrase
+        
+        return None
+    except Exception as e:
+        debug(f"Phrase validation error: {e}")
+        return None
+
+def wallet_from_phrase(phrase, index=0):
+    """
+    Derive wallet from 12-word phrase using BIP44 path
+    Path: m/44'/60'/0'/0/{index}
+    """
+    if not MNEMONIC_AVAILABLE:
+        return None
+    
+    try:
+        mnemo = Mnemonic("english")
+        
+        # Validate phrase first (optional - for speed, might skip)
+        # valid_phrase = validate_and_fix_phrase(phrase)
+        # if not valid_phrase:
+        #     return None
+        # phrase = valid_phrase
+        
+        # Generate seed from mnemonic
+        seed = mnemo.to_seed(phrase, passphrase="")
+        
+        # Derive key using BIP44 path for Ethereum
+        # Path: m/44'/60'/0'/0/0
+        if HDACCOUNT_AVAILABLE:
+            private_key = key_from_seed(seed, f"m/44'/60'/0'/0/{index}")
+        else:
+            # Fallback: use first 32 bytes of seed as private key
+            private_key = seed[:32]
+        
+        # Create account from private key
+        account = Account.from_key(private_key)
+        
+        return {
+            "address": account.address,
+            "private_key": private_key.hex() if isinstance(private_key, bytes) else private_key,
+            "phrase": phrase
+        }
+        
+    except Exception as e:
+        debug(f"Error deriving wallet from phrase: {e}")
+        return None
+
+def create_wallet_random():
+    """Create wallet from random 12-word phrase"""
+    phrase = generate_random_12word_phrase()
+    if not phrase:
+        return None
+    
+    wallet = wallet_from_phrase(phrase, index=0)
+    return wallet
 
 # ----------------- DeBank API call -----------------
 def fetch_debank_for_address(address):
@@ -216,6 +337,9 @@ def check_single_wallet(wallet, web3_clients):
     Check if wallet has balance or transaction history
     Returns enriched wallet dict if found, None if empty
     """
+    if not wallet:
+        return None
+    
     address = wallet["address"]
     STATS["total_checked"] += 1
     
@@ -223,6 +347,7 @@ def check_single_wallet(wallet, web3_clients):
     result = {
         "address": address,
         "private_key": wallet["private_key"],
+        "phrase": wallet.get("phrase", ""),
         "balance_usd": 0.0,
         "coins": {},
         "chains": [],
@@ -280,9 +405,10 @@ def scan_wallets_batch(count, web3_clients, max_workers=DEFAULT_WORKERS):
     Generate and scan wallets in batch
     Only save wallets with balance/history
     """
-    print(f"\n[+] Starting scan for {count:,} wallets...")
+    print(f"\n[+] Starting scan for {count:,} random 12-word phrases...")
     print(f"[+] Using {max_workers} concurrent workers")
-    print(f"[+] Mode: STEALTH (only save wallets with balance/history)\n")
+    print(f"[+] Mode: STEALTH (only save wallets with balance/history)")
+    print(f"[+] Search space: 2^128 possible phrases\n")
     
     STATS["start_time"] = time.time()
     found_count = 0
@@ -296,8 +422,9 @@ def scan_wallets_batch(count, web3_clients, max_workers=DEFAULT_WORKERS):
         futures = {}
         for i in range(count):
             wallet = create_wallet_random()
-            future = executor.submit(check_single_wallet, wallet, web3_clients)
-            futures[future] = i
+            if wallet:
+                future = executor.submit(check_single_wallet, wallet, web3_clients)
+                futures[future] = i
         
         # Process results as they complete
         for future in as_completed(futures):
@@ -318,7 +445,9 @@ def scan_wallets_batch(count, web3_clients, max_workers=DEFAULT_WORKERS):
                     print(f"\n{'🎉'*30}")
                     print(f"💰 WALLET FOUND #{found_count}!")
                     print(f"{'🎉'*30}")
+                    print(f"Phrase     : {result['phrase']}")
                     print(f"Address    : {result['address']}")
+                    print(f"Private Key: {result['private_key']}")
                     print(f"Balance USD: ${result['balance_usd']:.2f}")
                     print(f"Coins      : {result['coins']}")
                     print(f"Chains     : {result['chains']}")
@@ -346,17 +475,22 @@ def scan_wallets_batch(count, web3_clients, max_workers=DEFAULT_WORKERS):
 def menu_loop(cfg, web3_clients):
     print("""
 ╔══════════════════════════════════════════════════════════╗
-║     WALLET SCANNER - STEALTH MODE (Only Save Found)     ║
+║   WALLET SCANNER - 12-WORD PHRASE BRUTE FORCE MODE      ║
+║              (Only Save Found Wallets)                   ║
 ╚══════════════════════════════════════════════════════════╝
+
+⚠️  DISCLAIMER: This searches for lost/abandoned wallets
+    Probability: ~1 in 2^128 (practically impossible)
+    Educational/Research purposes only
 """)
     
     while True:
         print("""
 === MAIN MENU ===
-1) Quick scan (10 wallets)
-2) Medium scan (100 wallets)
-3) Large scan (1,000 wallets)
-4) Mega scan (10,000 wallets)
+1) Quick scan (10 phrases)
+2) Medium scan (100 phrases)
+3) Large scan (1,000 phrases)
+4) Mega scan (10,000 phrases)
 5) Custom scan (enter amount)
 6) View statistics
 7) Exit
@@ -373,7 +507,7 @@ def menu_loop(cfg, web3_clients):
             n = 10000
         elif ch == "5":
             try:
-                n = int(input("Enter number of wallets to scan: "))
+                n = int(input("Enter number of phrases to scan: "))
                 if n < 1:
                     print("[!] Number must be >= 1")
                     continue
@@ -392,7 +526,7 @@ def menu_loop(cfg, web3_clients):
         
         # Confirm large scans
         if n >= 10000:
-            confirm = input(f"\n⚠️  Scanning {n:,} wallets may take a while. Continue? (yes/no): ").strip().lower()
+            confirm = input(f"\n⚠️  Scanning {n:,} phrases may take a while. Continue? (yes/no): ").strip().lower()
             if confirm != "yes":
                 print("[+] Cancelled.\n")
                 continue
@@ -405,10 +539,22 @@ def menu_loop(cfg, web3_clients):
 def main():
     print("""
 ╔══════════════════════════════════════════════════════════╗
-║          WALLET GENERATOR & SCANNER v2.0                 ║
-║              STEALTH MODE - Mode A                       ║
+║        WALLET GENERATOR & SCANNER v3.0                   ║
+║      12-WORD PHRASE BRUTE FORCE EDITION                  ║
 ╚══════════════════════════════════════════════════════════╝
 """)
+    
+    # Check mnemonic library
+    if not MNEMONIC_AVAILABLE:
+        print("\n[!] CRITICAL ERROR: 'mnemonic' library not installed!")
+        print("    This script requires the mnemonic library to work.")
+        print("    Install it with: pip install mnemonic\n")
+        return
+    
+    # Load BIP39 wordlist
+    if not load_bip39_wordlist():
+        print("[!] Failed to load BIP39 wordlist. Exiting.")
+        return
     
     cfg = load_json_file(CONFIG_FILE)
     if not cfg:
@@ -438,7 +584,8 @@ def main():
         print("[+] Alchemy API key loaded")
 
     print(f"\n[+] Output file: {OUTPUT_FILE}")
-    print("[+] Only wallets with balance/history will be saved\n")
+    print("[+] Only wallets with balance/history will be saved")
+    print(f"[+] Search space: 2^128 (~3.4 × 10^38) possible 12-word phrases\n")
 
     # Run menu
     menu_loop(cfg, web3_clients)
