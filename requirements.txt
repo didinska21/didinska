@@ -1,4 +1,17 @@
+# Core dependencies for wallet_gen.py
 web3
 requests
 python-dotenv
 eth-account
+
+# BIP39 Mnemonic support (REQUIRED for 12-word phrase generation)
+mnemonic
+
+# Optional: for better performance
+aiohttp
+
+# Installation:
+# pip install -r requirements.txt
+#
+# Or install individually:
+# pip install web3 requests python-dotenv eth-account mnemonic
