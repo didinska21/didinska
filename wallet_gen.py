@@ -1,54 +1,59 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-wallet_gen.py - STEALTH MODE (Mode A) - 12 Word Phrase Edition
-
-Purpose: Random 12-word phrase generation + balance scanning
-Only saves wallets with balance > 0 or transaction history
-
-This script searches for lost/abandoned wallets by generating random
-12-word BIP39 phrases and checking if they have balance.
-
-Features:
-- Load keys from .env (DEBANK_ACCESS_KEY, ALCHEMY_API_KEY)
-- Load config.json, inject ${ALCHEMY_API_KEY}
-- Generate random 12-word BIP39 phrases
-- Multi-threaded balance checking (DeBank + RPC)
-- Nonce checking (detect used wallets even with 0 balance)
-- Save ONLY wallets with balance or history to hasil.json
-- Real-time statistics and progress tracking
+wallet_gen.py - DIDINSKA Edition v4.0
+Enhanced UI + Telegram Integration
 """
-
 import os
 import json
 import time
 import random
+import sys
 from decimal import Decimal, getcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-
 import requests
 from eth_account import Account
 from dotenv import load_dotenv
 
+# Color codes
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    
+    # Additional colors
+    MAGENTA = '\033[35m'
+    WHITE = '\033[97m'
+    GRAY = '\033[90m'
+    LIGHT_GREEN = '\033[92m'
+    LIGHT_BLUE = '\033[94m'
+    LIGHT_YELLOW = '\033[93m'
+
 try:
     from web3 import Web3, HTTPProvider
-except Exception:
+    WEB3_AVAILABLE = True
+except Exception as e:
     Web3 = None
     HTTPProvider = None
+    WEB3_AVAILABLE = False
 
 try:
     from mnemonic import Mnemonic
     MNEMONIC_AVAILABLE = True
-except Exception:
+except Exception as e:
     MNEMONIC_AVAILABLE = False
-    print("[!] WARNING: 'mnemonic' library not found!")
-    print("    Install it with: pip install mnemonic")
 
 try:
     from eth_account.hdaccount import key_from_seed, ETHEREUM_DEFAULT_PATH
     HDACCOUNT_AVAILABLE = True
-except Exception:
+except Exception as e:
     HDACCOUNT_AVAILABLE = False
 
 getcontext().prec = 36
@@ -59,13 +64,17 @@ DEBANK_ACCESS_KEY = os.getenv("DEBANK_ACCESS_KEY")
 ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY")
 CONFIG_FILE = os.getenv("CONFIG_FILE", "config.json")
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "hasil.json")
+EMPTY_WALLETS_FILE = os.getenv("EMPTY_WALLETS_FILE", "empty_wallets.json")
 DEBANK_BASE_URL = os.getenv("DEBANK_BASE_URL", "https://pro-openapi.debank.com")
 DEBANK_TIMEOUT = int(os.getenv("DEBANK_TIMEOUT", "15"))
 DEBUG_MODE = os.getenv("DEBUG_MODE", "False").lower() == "true"
 DEFAULT_WORKERS = int(os.getenv("CONCURRENT_WORKERS", "16"))
 
-# BIP39 English Wordlist (2048 words)
-# Loaded once at startup
+# Telegram Config
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
 BIP39_WORDLIST = None
 
 # ----------------- Global Stats -----------------
@@ -73,188 +82,329 @@ STATS = {
     "total_generated": 0,
     "total_checked": 0,
     "wallets_found": 0,
+    "empty_wallets": 0,
     "start_time": None,
-    "last_found": None
+    "last_found": None,
+    "errors": 0
 }
+
+# ----------------- ASCII Art & UI -----------------
+def print_header():
+    """Print fancy DIDINSKA header"""
+    header = f"""
+{Colors.CYAN}{Colors.BOLD}
+╔══════════════════════════════════════════════════════════════════════╗
+║                                                                      ║
+║  ██████╗ ██╗██████╗ ██╗███╗   ██╗███████╗██╗  ██╗ █████╗            ║
+║  ██╔══██╗██║██╔══██╗██║████╗  ██║██╔════╝██║ ██╔╝██╔══██╗           ║
+║  ██║  ██║██║██║  ██║██║██╔██╗ ██║███████╗█████╔╝ ███████║           ║
+║  ██║  ██║██║██║  ██║██║██║╚██╗██║╚════██║██╔═██╗ ██╔══██║           ║
+║  ██████╔╝██║██████╔╝██║██║ ╚████║███████║██║  ██╗██║  ██║           ║
+║  ╚═════╝ ╚═╝╚═════╝ ╚═╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝           ║
+║                                                                      ║
+║           🔍 WALLET HUNTER v4.0 - Enhanced Edition 🔍               ║
+║              12-Word Phrase Brute Force Scanner                      ║
+║                                                                      ║
+╚══════════════════════════════════════════════════════════════════════╝
+{Colors.ENDC}
+{Colors.YELLOW}┌─────────────────────────────────────────────────────────────────────┐
+│  ⚡ Features: Multi-Chain Scanner | Telegram Integration | Live UI  │
+│  🎯 Target: Lost/Abandoned Wallets | Research & Educational Only    │
+│  🔐 Privacy: Local Processing | No Data Collection                  │
+└─────────────────────────────────────────────────────────────────────┘{Colors.ENDC}
+"""
+    print(header)
+
+def print_loader(text, duration=2):
+    """Animated loader"""
+    frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+    end_time = time.time() + duration
+    i = 0
+    while time.time() < end_time:
+        sys.stdout.write(f'\r{Colors.CYAN}{frames[i % len(frames)]} {text}...{Colors.ENDC}')
+        sys.stdout.flush()
+        time.sleep(0.1)
+        i += 1
+    sys.stdout.write('\r' + ' ' * (len(text) + 10) + '\r')
+    sys.stdout.flush()
+
+def print_box(title, content, color=Colors.CYAN):
+    """Print content in a box"""
+    width = 70
+    print(f"\n{color}╔{'═' * width}╗")
+    print(f"║ {title.center(width - 2)} ║")
+    print(f"╠{'═' * width}╣")
+    for line in content:
+        print(f"║ {line.ljust(width - 2)} ║")
+    print(f"╚{'═' * width}╝{Colors.ENDC}\n")
+
+def print_progress_bar(current, total, prefix='Progress:', length=50):
+    """Print animated progress bar"""
+    percent = current / total if total > 0 else 0
+    filled = int(length * percent)
+    bar = '█' * filled + '░' * (length - filled)
+    
+    sys.stdout.write(f'\r{Colors.GREEN}{prefix} |{bar}| {percent*100:.1f}% ({current}/{total}){Colors.ENDC}')
+    sys.stdout.flush()
+
+# ----------------- Telegram Integration -----------------
+def send_telegram_message(message, parse_mode='HTML'):
+    """Send message to Telegram"""
+    if not TELEGRAM_ENABLED:
+        return False
+    
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": parse_mode
+        }
+        response = requests.post(url, data=data, timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        debug(f"Telegram send error: {e}")
+        return False
+
+def notify_wallet_found(wallet_data):
+    """Send notification for wallet with balance"""
+    message = f"""
+🎉 <b>WALLET FOUND!</b> 🎉
+
+💰 <b>Balance:</b> ${wallet_data['balance_usd']:.2f}
+📍 <b>Address:</b> <code>{wallet_data['address']}</code>
+🔑 <b>Private Key:</b> <code>{wallet_data['private_key']}</code>
+📝 <b>Phrase:</b> <code>{wallet_data['phrase']}</code>
+
+💎 <b>Coins:</b>
+{chr(10).join([f"  • {sym}: {amt}" for sym, amt in wallet_data['coins'].items()])}
+
+🌐 <b>Chains:</b> {', '.join(wallet_data['chains']) if wallet_data['chains'] else 'Multiple'}
+📊 <b>Transactions:</b> {wallet_data['nonce']}
+⏰ <b>Found at:</b> {wallet_data['found_at']}
+
+<i>DIDINSKA Wallet Hunter v4.0</i>
+"""
+    return send_telegram_message(message)
+
+def notify_empty_wallets_batch(count, total_checked):
+    """Send batch notification for empty wallets"""
+    message = f"""
+📭 <b>Empty Wallets Report</b>
+
+🔍 Scanned: {count} wallets
+❌ Empty: {count}
+📊 Total Checked: {total_checked}
+⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+<i>Batch scan completed - DIDINSKA</i>
+"""
+    return send_telegram_message(message)
+
+def notify_scan_start(count, workers):
+    """Notify scan start"""
+    message = f"""
+🚀 <b>Scan Started</b>
+
+🎯 Target: {count:,} wallets
+⚡ Workers: {workers}
+🕐 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+<i>DIDINSKA Wallet Hunter is running...</i>
+"""
+    return send_telegram_message(message)
+
+def notify_scan_complete(stats):
+    """Notify scan completion"""
+    elapsed = time.time() - stats["start_time"] if stats["start_time"] else 0
+    rate = stats["total_checked"] / elapsed if elapsed > 0 else 0
+    
+    message = f"""
+✅ <b>Scan Completed</b>
+
+📊 <b>Statistics:</b>
+  • Generated: {stats['total_generated']:,}
+  • Checked: {stats['total_checked']:,}
+  • Found: {stats['wallets_found']}
+  • Empty: {stats['empty_wallets']:,}
+  • Speed: {rate:.2f} wallet/s
+  • Runtime: {elapsed:.2f}s
+
+<i>DIDINSKA Wallet Hunter</i>
+"""
+    return send_telegram_message(message)
 
 # ----------------- Helpers -----------------
 def debug(*args):
     if DEBUG_MODE:
-        print("[DEBUG]", *args)
+        print(f"{Colors.GRAY}[DEBUG]{Colors.ENDC}", *args)
 
-def load_json_file(path):
-    if not os.path.exists(path):
-        return []
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-        return data if isinstance(data, list) else []
+def load_json_file(path, expect_list=False):
+    """Load JSON file"""
+    try:
+        if not os.path.exists(path):
+            return [] if expect_list else {}
+        
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            
+        if expect_list:
+            return data if isinstance(data, list) else []
+        else:
+            return data if isinstance(data, dict) else {}
+            
+    except json.JSONDecodeError as e:
+        print(f"{Colors.RED}[!] JSON decode error in {path}: {e}{Colors.ENDC}")
+        return [] if expect_list else {}
+    except Exception as e:
+        print(f"{Colors.RED}[!] Unexpected error loading {path}: {e}{Colors.ENDC}")
+        return [] if expect_list else {}
 
 def save_json_file(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    """Save data to JSON file"""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"{Colors.RED}[!] Error saving {path}: {e}{Colors.ENDC}")
 
 def append_to_results(wallet_data):
-    """Append single wallet to hasil.json (incremental save)"""
-    existing = load_json_file(OUTPUT_FILE)
+    """Append wallet with balance to hasil.json"""
+    existing = load_json_file(OUTPUT_FILE, expect_list=True)
     existing.append(wallet_data)
     save_json_file(OUTPUT_FILE, existing)
 
+def append_to_empty_wallets(wallet_data):
+    """Append empty wallet to empty_wallets.json"""
+    existing = load_json_file(EMPTY_WALLETS_FILE, expect_list=True)
+    existing.append(wallet_data)
+    save_json_file(EMPTY_WALLETS_FILE, existing)
+
 def print_stats():
-    """Print real-time statistics"""
+    """Print colorful statistics"""
     elapsed = time.time() - STATS["start_time"] if STATS["start_time"] else 0
     rate = STATS["total_checked"] / elapsed if elapsed > 0 else 0
+    success_rate = (STATS['wallets_found']/STATS['total_checked']*100) if STATS['total_checked'] > 0 else 0
     
-    print(f"\n{'='*60}")
-    print(f"📊 STATISTICS")
-    print(f"{'='*60}")
-    print(f"Generated    : {STATS['total_generated']:,} phrases")
-    print(f"Checked      : {STATS['total_checked']:,} wallets")
-    print(f"Found (💰)   : {STATS['wallets_found']:,} wallets with balance/history")
-    print(f"Success Rate : {(STATS['wallets_found']/STATS['total_checked']*100) if STATS['total_checked'] > 0 else 0:.8f}%")
-    print(f"Speed        : {rate:.2f} wallet/s")
-    print(f"Runtime      : {elapsed:.2f}s")
+    stats_content = [
+        f"{Colors.CYAN}📊 Generated    :{Colors.ENDC} {Colors.WHITE}{STATS['total_generated']:,}{Colors.ENDC} phrases",
+        f"{Colors.BLUE}🔍 Checked      :{Colors.ENDC} {Colors.WHITE}{STATS['total_checked']:,}{Colors.ENDC} wallets",
+        f"{Colors.GREEN}💰 Found        :{Colors.ENDC} {Colors.LIGHT_GREEN}{STATS['wallets_found']:,}{Colors.ENDC} with balance",
+        f"{Colors.YELLOW}📭 Empty        :{Colors.ENDC} {Colors.WHITE}{STATS['empty_wallets']:,}{Colors.ENDC} wallets",
+        f"{Colors.MAGENTA}⚡ Success Rate :{Colors.ENDC} {Colors.LIGHT_YELLOW}{success_rate:.8f}%{Colors.ENDC}",
+        f"{Colors.CYAN}🚀 Speed        :{Colors.ENDC} {Colors.WHITE}{rate:.2f}{Colors.ENDC} wallet/s",
+        f"{Colors.BLUE}⏱️  Runtime      :{Colors.ENDC} {Colors.WHITE}{elapsed:.2f}s{Colors.ENDC}",
+    ]
+    
     if STATS["last_found"]:
-        print(f"Last Found   : {STATS['last_found']}")
-    print(f"{'='*60}\n")
+        stats_content.append(f"{Colors.GREEN}🎯 Last Found   :{Colors.ENDC} {Colors.WHITE}{STATS['last_found'][:20]}...{Colors.ENDC}")
+    
+    print_box("📊 LIVE STATISTICS", stats_content, Colors.CYAN)
 
 # ----------------- Config / RPC setup -----------------
 def inject_alchemy_key(cfg):
-    """Replace ${ALCHEMY_API_KEY} placeholders with env value."""
+    """Replace ${ALCHEMY_API_KEY} placeholders"""
     if not ALCHEMY_API_KEY:
-        debug("No ALCHEMY_API_KEY set in .env; URLs left unmodified.")
+        debug("No ALCHEMY_API_KEY set")
         return cfg
+    
+    if not isinstance(cfg, dict):
+        return cfg
+    
     rpcs = cfg.get("rpcs", {})
     for k, v in rpcs.items():
+        if not isinstance(v, dict):
+            continue
         url = v.get("rpc_url", "")
         if "${ALCHEMY_API_KEY}" in url:
             v["rpc_url"] = url.replace("${ALCHEMY_API_KEY}", ALCHEMY_API_KEY)
     return cfg
 
 def build_web3_clients(cfg, timeout=10):
-    """Create Web3 clients for EVM chains that have rpc_url and evm != False."""
+    """Create Web3 clients for EVM chains"""
     clients = {}
-    if Web3 is None:
-        debug("web3 not available; RPC fallback disabled.")
+    
+    if not WEB3_AVAILABLE:
+        debug("web3 not available")
         return clients
-
+    
+    if not isinstance(cfg, dict):
+        return clients
+    
     rpcs = cfg.get("rpcs", {})
     for chain, info in rpcs.items():
-        if info.get("evm") is False:
-            debug(f"Skipping non-EVM chain {chain}")
+        if not isinstance(info, dict):
             continue
+            
+        if info.get("evm") is False:
+            continue
+            
         url = info.get("rpc_url")
         if not url:
-            debug(f"No rpc_url for chain {chain}; skipping.")
             continue
+            
         try:
             w3 = Web3(HTTPProvider(url, request_kwargs={"timeout": timeout}))
             if not w3.is_connected():
-                debug(f"Web3 not connected for {chain} @ {url[:60]}...")
                 continue
             clients[chain] = {
                 "w3": w3, 
                 "native_symbol": info.get("native_symbol", "ETH"),
                 "name": info.get("name", chain)
             }
-            debug(f"Connected RPC: {chain}")
+            print(f"{Colors.GREEN}✓{Colors.ENDC} Connected: {Colors.CYAN}{chain}{Colors.ENDC}")
         except Exception as e:
-            debug(f"Failed RPC init {chain}: {e}")
+            print(f"{Colors.RED}✗{Colors.ENDC} Failed: {Colors.GRAY}{chain}{Colors.ENDC}")
+    
     return clients
 
-# ----------------- BIP39 Wordlist Loading -----------------
+# ----------------- BIP39 Wordlist -----------------
 def load_bip39_wordlist():
-    """Load BIP39 English wordlist (2048 words)"""
+    """Load BIP39 wordlist"""
     global BIP39_WORDLIST
     
     if not MNEMONIC_AVAILABLE:
-        print("[!] ERROR: Cannot load BIP39 wordlist - mnemonic library not installed")
+        print(f"{Colors.RED}[!] ERROR: mnemonic library not installed{Colors.ENDC}")
         return False
     
     try:
         mnemo = Mnemonic("english")
         BIP39_WORDLIST = mnemo.wordlist
-        print(f"[+] BIP39 wordlist loaded: {len(BIP39_WORDLIST)} words")
+        print(f"{Colors.GREEN}[+] BIP39 wordlist loaded: {len(BIP39_WORDLIST)} words{Colors.ENDC}")
         return True
     except Exception as e:
-        print(f"[!] Failed to load BIP39 wordlist: {e}")
+        print(f"{Colors.RED}[!] Failed to load BIP39 wordlist: {e}{Colors.ENDC}")
         return False
 
-# ----------------- Wallet generation from 12-word phrase -----------------
+# ----------------- Wallet Generation -----------------
 def generate_random_12word_phrase():
-    """Generate a random 12-word phrase from BIP39 wordlist"""
+    """Generate random 12-word phrase"""
     if not BIP39_WORDLIST:
         return None
     
-    # Generate 12 random words from the 2048 word list
-    # Note: This is PURE random, not using proper entropy + checksum
-    # For true BIP39, last word contains checksum, but for brute force we try all combinations
     words = [random.choice(BIP39_WORDLIST) for _ in range(12)]
     phrase = " ".join(words)
     
     STATS["total_generated"] += 1
     return phrase
 
-def validate_and_fix_phrase(phrase):
-    """
-    Try to validate phrase. If invalid checksum, try to fix it.
-    Returns valid phrase or None
-    """
-    if not MNEMONIC_AVAILABLE:
-        return phrase  # Can't validate without mnemonic library
-    
-    try:
-        mnemo = Mnemonic("english")
-        
-        # Check if phrase is valid
-        if mnemo.check(phrase):
-            return phrase
-        
-        # If not valid, try to fix checksum by adjusting last word
-        words = phrase.split()
-        if len(words) != 12:
-            return None
-        
-        # Try different last words until we find valid checksum
-        # (This is brute force on the last word only)
-        for word in BIP39_WORDLIST:
-            test_phrase = " ".join(words[:-1] + [word])
-            if mnemo.check(test_phrase):
-                return test_phrase
-        
-        return None
-    except Exception as e:
-        debug(f"Phrase validation error: {e}")
-        return None
-
 def wallet_from_phrase(phrase, index=0):
-    """
-    Derive wallet from 12-word phrase using BIP44 path
-    Path: m/44'/60'/0'/0/{index}
-    """
+    """Derive wallet from phrase"""
     if not MNEMONIC_AVAILABLE:
         return None
     
     try:
         mnemo = Mnemonic("english")
-        
-        # Validate phrase first (optional - for speed, might skip)
-        # valid_phrase = validate_and_fix_phrase(phrase)
-        # if not valid_phrase:
-        #     return None
-        # phrase = valid_phrase
-        
-        # Generate seed from mnemonic
         seed = mnemo.to_seed(phrase, passphrase="")
         
-        # Derive key using BIP44 path for Ethereum
-        # Path: m/44'/60'/0'/0/0
         if HDACCOUNT_AVAILABLE:
-            private_key = key_from_seed(seed, f"m/44'/60'/0'/0/{index}")
+            try:
+                private_key = key_from_seed(seed, f"m/44'/60'/0'/0/{index}")
+            except Exception:
+                private_key = seed[:32]
         else:
-            # Fallback: use first 32 bytes of seed as private key
             private_key = seed[:32]
         
-        # Create account from private key
         account = Account.from_key(private_key)
         
         return {
@@ -264,11 +414,11 @@ def wallet_from_phrase(phrase, index=0):
         }
         
     except Exception as e:
-        debug(f"Error deriving wallet from phrase: {e}")
+        debug(f"Error deriving wallet: {e}")
         return None
 
 def create_wallet_random():
-    """Create wallet from random 12-word phrase"""
+    """Create random wallet"""
     phrase = generate_random_12word_phrase()
     if not phrase:
         return None
@@ -276,24 +426,29 @@ def create_wallet_random():
     wallet = wallet_from_phrase(phrase, index=0)
     return wallet
 
-# ----------------- DeBank API call -----------------
+# ----------------- API Calls -----------------
 def fetch_debank_for_address(address):
-    """Return dict: {'coins': {symbol: amount}, 'balance_usd': total} or None on failure."""
+    """Fetch from DeBank API"""
     if not DEBANK_ACCESS_KEY:
-        debug("No DeBank key; skipping DeBank call.")
         return None
+    
     headers = {"accept": "application/json", "AccessKey": DEBANK_ACCESS_KEY}
     url = f"{DEBANK_BASE_URL}/v1/user/all_token_list"
     params = {"id": address}
+    
     try:
         r = requests.get(url, headers=headers, params=params, timeout=DEBANK_TIMEOUT)
-        if r.status_code != 200:
-            debug(f"DeBank status {r.status_code} for {address}: {r.text[:200]}")
+        if r.status_code == 429:
+            print(f"{Colors.YELLOW}⚠️  DeBank rate limit hit{Colors.ENDC}")
             return None
+        if r.status_code != 200:
+            return None
+            
         data = r.json()
         items = data.get("data") or []
         coins = {}
         total_usd = Decimal(0)
+        
         for t in items:
             try:
                 sym = (t.get("symbol") or "").upper()
@@ -302,48 +457,42 @@ def fetch_debank_for_address(address):
                 if amt > 0 and sym:
                     coins[sym] = float(amt)
                     total_usd += amt * price
-            except Exception as e:
-                debug("DeBank item parse err:", e)
+            except Exception:
+                pass
+                
         return {"coins": coins, "balance_usd": float(total_usd)}
     except Exception as e:
-        debug("DeBank request error:", e)
+        debug(f"DeBank error: {e}")
         return None
 
-# ----------------- RPC checks -----------------
 def fetch_native_balance_for_chain(client, address):
-    """Get native balance for chain"""
+    """Get native balance"""
     try:
         w3 = client["w3"]
         bal_wei = w3.eth.get_balance(address)
         val = Decimal(bal_wei) / Decimal(10 ** 18)
         return float(val)
-    except Exception as e:
-        debug("RPC balance error:", e)
+    except Exception:
         return None
 
 def fetch_nonce_for_chain(client, address):
-    """Check transaction count (nonce) - if > 0, wallet has been used"""
+    """Get transaction count"""
     try:
         w3 = client["w3"]
         nonce = w3.eth.get_transaction_count(address)
         return nonce
-    except Exception as e:
-        debug("RPC nonce error:", e)
+    except Exception:
         return 0
 
-# ----------------- Single wallet check -----------------
+# ----------------- Wallet Checking -----------------
 def check_single_wallet(wallet, web3_clients):
-    """
-    Check if wallet has balance or transaction history
-    Returns enriched wallet dict if found, None if empty
-    """
+    """Check if wallet has balance or history"""
     if not wallet:
         return None
     
     address = wallet["address"]
     STATS["total_checked"] += 1
     
-    # Result structure
     result = {
         "address": address,
         "private_key": wallet["private_key"],
@@ -357,7 +506,7 @@ def check_single_wallet(wallet, web3_clients):
     
     has_value = False
     
-    # 1) Check DeBank
+    # Check DeBank
     debank_data = fetch_debank_for_address(address)
     if debank_data:
         coins = debank_data.get("coins", {})
@@ -366,12 +515,10 @@ def check_single_wallet(wallet, web3_clients):
             result["coins"].update(coins)
             result["balance_usd"] = balance_usd
             has_value = True
-            debug(f"💰 DeBank: {address[:10]}... has ${balance_usd:.2f}")
     
-    # 2) Check native balances + nonce across all chains
+    # Check chains
     max_nonce = 0
     for chain, client in web3_clients.items():
-        # Check balance
         bal = fetch_native_balance_for_chain(client, address)
         if bal and bal > 0:
             sym = client.get("native_symbol", chain.upper())
@@ -379,123 +526,159 @@ def check_single_wallet(wallet, web3_clients):
             prev = Decimal(str(result["coins"].get(sym, 0.0)))
             result["coins"][sym] = float(prev + Decimal(str(bal)))
             has_value = True
-            debug(f"💰 {chain}: {address[:10]}... has {bal} {sym}")
         
-        # Check nonce (transaction history)
         nonce = fetch_nonce_for_chain(client, address)
         if nonce > max_nonce:
             max_nonce = nonce
     
     result["nonce"] = max_nonce
     
-    # Wallet has been used before (even if balance is 0 now)
     if max_nonce > 0:
         has_value = True
-        debug(f"📝 {address[:10]}... has {max_nonce} transactions")
     
-    # Return result only if wallet has value or history
     if has_value:
         return result
     
     return None
 
-# ----------------- Batch processing -----------------
+# ----------------- Batch Scanning -----------------
 def scan_wallets_batch(count, web3_clients, max_workers=DEFAULT_WORKERS):
-    """
-    Generate and scan wallets in batch
-    Only save wallets with balance/history
-    """
-    print(f"\n[+] Starting scan for {count:,} random 12-word phrases...")
-    print(f"[+] Using {max_workers} concurrent workers")
-    print(f"[+] Mode: STEALTH (only save wallets with balance/history)")
-    print(f"[+] Search space: 2^128 possible phrases\n")
+    """Scan wallets in batch"""
+    
+    # Print scan info
+    scan_info = [
+        f"🎯 Target       : {count:,} wallets",
+        f"⚡ Workers      : {max_workers}",
+        f"🔍 Mode         : Stealth (save only found)",
+        f"📊 Search Space : 2^128 combinations",
+        f"💾 Results      : {OUTPUT_FILE}",
+        f"📭 Empty        : {EMPTY_WALLETS_FILE}",
+    ]
+    
+    if TELEGRAM_ENABLED:
+        scan_info.append(f"📱 Telegram     : {Colors.GREEN}✓ Enabled{Colors.ENDC}")
+    else:
+        scan_info.append(f"📱 Telegram     : {Colors.GRAY}✗ Disabled{Colors.ENDC}")
+    
+    print_box("🚀 SCAN CONFIGURATION", scan_info, Colors.YELLOW)
+    
+    # Send telegram notification
+    if TELEGRAM_ENABLED:
+        notify_scan_start(count, max_workers)
     
     STATS["start_time"] = time.time()
     found_count = 0
+    empty_count = 0
     
-    # Progress tracking
     last_update = time.time()
-    update_interval = 5  # Update stats every 5 seconds
+    update_interval = 5
+    last_telegram_batch = time.time()
+    telegram_batch_interval = 60  # Send empty wallet batch every 60s
+    
+    print(f"\n{Colors.CYAN}{'='*70}{Colors.ENDC}")
+    print(f"{Colors.BOLD}{Colors.GREEN}🔍 SCANNING IN PROGRESS...{Colors.ENDC}")
+    print(f"{Colors.CYAN}{'='*70}{Colors.ENDC}\n")
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all wallet generation + checking tasks
         futures = {}
         for i in range(count):
             wallet = create_wallet_random()
             if wallet:
                 future = executor.submit(check_single_wallet, wallet, web3_clients)
-                futures[future] = i
+                futures[future] = wallet
         
-        # Process results as they complete
         for future in as_completed(futures):
-            idx = futures[future]
+            wallet = futures[future]
             try:
                 result = future.result()
                 
-                # If wallet has value, save immediately
                 if result:
+                    # Wallet with balance found!
                     found_count += 1
                     STATS["wallets_found"] = found_count
                     STATS["last_found"] = result["address"]
                     
-                    # Save to file immediately (incremental)
                     append_to_results(result)
                     
-                    # Print found wallet info
-                    print(f"\n{'🎉'*30}")
-                    print(f"💰 WALLET FOUND #{found_count}!")
-                    print(f"{'🎉'*30}")
-                    print(f"Phrase     : {result['phrase']}")
-                    print(f"Address    : {result['address']}")
-                    print(f"Private Key: {result['private_key']}")
-                    print(f"Balance USD: ${result['balance_usd']:.2f}")
-                    print(f"Coins      : {result['coins']}")
-                    print(f"Chains     : {result['chains']}")
-                    print(f"Nonce      : {result['nonce']}")
-                    print(f"{'🎉'*30}\n")
+                    # Print found wallet
+                    print(f"\n{Colors.GREEN}{'🎉' * 35}{Colors.ENDC}")
+                    print(f"{Colors.BOLD}{Colors.LIGHT_GREEN}💰 WALLET FOUND #{found_count}!{Colors.ENDC}")
+                    print(f"{Colors.GREEN}{'🎉' * 35}{Colors.ENDC}")
+                    print(f"{Colors.CYAN}Phrase     :{Colors.ENDC} {Colors.WHITE}{result['phrase']}{Colors.ENDC}")
+                    print(f"{Colors.CYAN}Address    :{Colors.ENDC} {Colors.YELLOW}{result['address']}{Colors.ENDC}")
+                    print(f"{Colors.CYAN}Balance USD:{Colors.ENDC} {Colors.GREEN}${result['balance_usd']:.2f}{Colors.ENDC}")
+                    print(f"{Colors.CYAN}Coins      :{Colors.ENDC} {Colors.WHITE}{result['coins']}{Colors.ENDC}")
+                    print(f"{Colors.CYAN}Nonce      :{Colors.ENDC} {Colors.WHITE}{result['nonce']}{Colors.ENDC}")
+                    print(f"{Colors.GREEN}{'🎉' * 35}{Colors.ENDC}\n")
+                    
+                    # Send to Telegram
+                    if TELEGRAM_ENABLED:
+                        notify_wallet_found(result)
+                else:
+                    # Empty wallet
+                    empty_count += 1
+                    STATS["empty_wallets"] = empty_count
+                    
+                    empty_data = {
+                        "address": wallet["address"],
+                        "phrase": wallet["phrase"],
+                        "checked_at": datetime.now().isoformat()
+                    }
+                    append_to_empty_wallets(empty_data)
+                
+                # Update progress bar
+                print_progress_bar(STATS["total_checked"], count)
                 
                 # Update stats periodically
                 if time.time() - last_update > update_interval:
+                    print()  # New line after progress bar
                     print_stats()
                     last_update = time.time()
+                
+                # Send telegram batch for empty wallets
+                if TELEGRAM_ENABLED and time.time() - last_telegram_batch > telegram_batch_interval:
+                    if empty_count > 0:
+                        notify_empty_wallets_batch(empty_count, STATS["total_checked"])
+                    last_telegram_batch = time.time()
                     
             except Exception as e:
+                STATS["errors"] += 1
                 debug(f"Error processing wallet: {e}")
     
     # Final stats
+    print("\n")
     print_stats()
-    print(f"[+] Scan completed!")
-    print(f"[+] Results saved to: {OUTPUT_FILE}")
-    if found_count > 0:
-        print(f"[+] {found_count} wallet(s) with balance/history saved! 🎉\n")
-    else:
-        print(f"[+] No wallets with balance found in this batch.\n")
+    
+    completion_info = [
+        f"✅ Scan completed successfully!",
+        f"💰 Found wallets  : {found_count}",
+        f"📭 Empty wallets  : {empty_count}",
+        f"💾 Saved to       : {OUTPUT_FILE}",
+        f"📝 Empty saved to : {EMPTY_WALLETS_FILE}",
+    ]
+    print_box("🏁 SCAN COMPLETE", completion_info, Colors.GREEN)
+    
+    # Send telegram completion
+    if TELEGRAM_ENABLED:
+        notify_scan_complete(STATS)
 
-# ----------------- Menu / CLI -----------------
+# ----------------- Menu -----------------
 def menu_loop(cfg, web3_clients):
-    print("""
-╔══════════════════════════════════════════════════════════╗
-║   WALLET SCANNER - 12-WORD PHRASE BRUTE FORCE MODE      ║
-║              (Only Save Found Wallets)                   ║
-╚══════════════════════════════════════════════════════════╝
-
-⚠️  DISCLAIMER: This searches for lost/abandoned wallets
-    Probability: ~1 in 2^128 (practically impossible)
-    Educational/Research purposes only
-""")
+    """Main menu"""
     
     while True:
-        print("""
-=== MAIN MENU ===
-1) Quick scan (10 phrases)
-2) Medium scan (100 phrases)
-3) Large scan (1,000 phrases)
-4) Mega scan (10,000 phrases)
-5) Custom scan (enter amount)
-6) View statistics
-7) Exit
-""")
-        ch = input("Choose (1-7): ").strip()
+        menu_content = [
+            f"{Colors.CYAN}1){Colors.ENDC} Quick scan      {Colors.GRAY}(10 wallets){Colors.ENDC}",
+            f"{Colors.CYAN}2){Colors.ENDC} Medium scan     {Colors.GRAY}(100 wallets){Colors.ENDC}",
+            f"{Colors.CYAN}3){Colors.ENDC} Large scan      {Colors.GRAY}(1,000 wallets){Colors.ENDC}",
+            f"{Colors.CYAN}4){Colors.ENDC} Mega scan       {Colors.GRAY}(10,000 wallets){Colors.ENDC}",
+            f"{Colors.CYAN}5){Colors.ENDC} Custom scan     {Colors.GRAY}(enter amount){Colors.ENDC}",
+            f"{Colors.CYAN}6){Colors.ENDC} View statistics {Colors.GRAY}(live stats){Colors.ENDC}",
+            f"{Colors.CYAN}7){Colors.ENDC} Exit            {Colors.GRAY}(quit program){Colors.ENDC}",
+        ]
+        print_box("📋 MAIN MENU", menu_content, Colors.BLUE)
+        
+        ch = input(f"{Colors.YELLOW}Choose (1-7): {Colors.ENDC}").strip()
         
         if ch == "1":
             n = 10
@@ -507,28 +690,28 @@ def menu_loop(cfg, web3_clients):
             n = 10000
         elif ch == "5":
             try:
-                n = int(input("Enter number of phrases to scan: "))
+                n = int(input(f"{Colors.CYAN}Enter number of wallets to scan: {Colors.ENDC}"))
                 if n < 1:
-                    print("[!] Number must be >= 1")
+                    print(f"{Colors.RED}[!] Number must be >= 1{Colors.ENDC}")
                     continue
             except ValueError:
-                print("[!] Invalid number")
+                print(f"{Colors.RED}[!] Invalid number{Colors.ENDC}")
                 continue
         elif ch == "6":
             print_stats()
             continue
         elif ch == "7":
-            print("\n[+] Exiting. Good luck! 🍀\n")
+            print(f"\n{Colors.GREEN}[+] Exiting DIDINSKA Wallet Hunter. Good luck! 🍀{Colors.ENDC}\n")
             break
         else:
-            print("[!] Invalid choice")
+            print(f"{Colors.RED}[!] Invalid choice{Colors.ENDC}")
             continue
         
         # Confirm large scans
         if n >= 10000:
-            confirm = input(f"\n⚠️  Scanning {n:,} phrases may take a while. Continue? (yes/no): ").strip().lower()
+            confirm = input(f"\n{Colors.YELLOW}⚠️  Scanning {n:,} wallets may take a while. Continue? (yes/no): {Colors.ENDC}").strip().lower()
             if confirm != "yes":
-                print("[+] Cancelled.\n")
+                print(f"{Colors.YELLOW}[+] Cancelled.{Colors.ENDC}\n")
                 continue
         
         # Run scan
@@ -537,58 +720,125 @@ def menu_loop(cfg, web3_clients):
 
 # ----------------- Main -----------------
 def main():
-    print("""
-╔══════════════════════════════════════════════════════════╗
-║        WALLET GENERATOR & SCANNER v3.0                   ║
-║      12-WORD PHRASE BRUTE FORCE EDITION                  ║
-╚══════════════════════════════════════════════════════════╝
-""")
+    """Main function"""
+    print_header()
     
-    # Check mnemonic library
+    # Check dependencies
+    print(f"{Colors.CYAN}[+] Checking dependencies...{Colors.ENDC}")
+    print_loader("Loading modules", 1)
+    
+    dependencies = []
+    if MNEMONIC_AVAILABLE:
+        dependencies.append(f"{Colors.GREEN}✓{Colors.ENDC} mnemonic")
+    else:
+        dependencies.append(f"{Colors.RED}✗{Colors.ENDC} mnemonic {Colors.RED}(REQUIRED){Colors.ENDC}")
+    
+    if WEB3_AVAILABLE:
+        dependencies.append(f"{Colors.GREEN}✓{Colors.ENDC} web3")
+    else:
+        dependencies.append(f"{Colors.YELLOW}⚠{Colors.ENDC} web3 {Colors.YELLOW}(optional){Colors.ENDC}")
+    
+    if HDACCOUNT_AVAILABLE:
+        dependencies.append(f"{Colors.GREEN}✓{Colors.ENDC} hdaccount")
+    else:
+        dependencies.append(f"{Colors.YELLOW}⚠{Colors.ENDC} hdaccount {Colors.YELLOW}(optional){Colors.ENDC}")
+    
+    print_box("📦 DEPENDENCIES", dependencies, Colors.CYAN)
+    
     if not MNEMONIC_AVAILABLE:
-        print("\n[!] CRITICAL ERROR: 'mnemonic' library not installed!")
-        print("    This script requires the mnemonic library to work.")
-        print("    Install it with: pip install mnemonic\n")
+        print(f"{Colors.RED}[!] CRITICAL ERROR: 'mnemonic' library not installed!{Colors.ENDC}")
+        print(f"{Colors.YELLOW}    Install with: pip install mnemonic{Colors.ENDC}\n")
         return
     
     # Load BIP39 wordlist
+    print_loader("Loading BIP39 wordlist", 1)
     if not load_bip39_wordlist():
-        print("[!] Failed to load BIP39 wordlist. Exiting.")
+        print(f"{Colors.RED}[!] Failed to load BIP39 wordlist. Exiting.{Colors.ENDC}")
         return
     
-    cfg = load_json_file(CONFIG_FILE)
-    if not cfg:
-        print(f"[!] '{CONFIG_FILE}' empty or missing. Create it first.")
+    # Load config
+    print(f"{Colors.CYAN}[+] Loading configuration...{Colors.ENDC}")
+    print_loader("Reading config.json", 1)
+    
+    cfg = load_json_file(CONFIG_FILE, expect_list=False)
+    
+    if not cfg or not isinstance(cfg, dict):
+        print(f"{Colors.RED}[!] '{CONFIG_FILE}' empty, missing, or invalid format.{Colors.ENDC}")
+        print(f"{Colors.YELLOW}[!] Please create a valid config.json file.{Colors.ENDC}")
         return
-
-    # Inject alchemy key into URLs
+    
+    print(f"{Colors.GREEN}[+] Config loaded successfully{Colors.ENDC}")
+    
+    # Inject API keys
     cfg = inject_alchemy_key(cfg)
-
-    # Prepare web3 clients
+    
+    # Build RPC connections
+    print(f"\n{Colors.CYAN}[+] Initializing RPC connections...{Colors.ENDC}")
+    print_loader("Connecting to blockchains", 2)
+    
     web3_clients = build_web3_clients(cfg)
     
     if not web3_clients:
-        print("[!] Warning: No RPC connections established. Balance checking will be limited.")
+        print(f"{Colors.YELLOW}[!] Warning: No RPC connections established{Colors.ENDC}")
     else:
-        print(f"[+] Connected to {len(web3_clients)} chain(s): {', '.join(web3_clients.keys())}")
-
-    # Security notes
-    if not DEBANK_ACCESS_KEY:
-        print("[!] Warning: DEBANK_ACCESS_KEY not found. DeBank integration disabled.")
-    else:
-        print("[+] DeBank API connected")
+        print(f"{Colors.GREEN}[+] Connected to {len(web3_clients)} chain(s){Colors.ENDC}\n")
     
-    if not ALCHEMY_API_KEY:
-        print("[!] Warning: ALCHEMY_API_KEY not found. Some RPC URLs may fail.")
+    # API Status
+    api_status = []
+    
+    if DEBANK_ACCESS_KEY:
+        api_status.append(f"{Colors.GREEN}✓{Colors.ENDC} DeBank API: {Colors.GREEN}Connected{Colors.ENDC}")
     else:
-        print("[+] Alchemy API key loaded")
-
-    print(f"\n[+] Output file: {OUTPUT_FILE}")
-    print("[+] Only wallets with balance/history will be saved")
-    print(f"[+] Search space: 2^128 (~3.4 × 10^38) possible 12-word phrases\n")
-
+        api_status.append(f"{Colors.YELLOW}⚠{Colors.ENDC} DeBank API: {Colors.GRAY}Not configured{Colors.ENDC}")
+    
+    if ALCHEMY_API_KEY:
+        api_status.append(f"{Colors.GREEN}✓{Colors.ENDC} Alchemy API: {Colors.GREEN}Connected{Colors.ENDC}")
+    else:
+        api_status.append(f"{Colors.YELLOW}⚠{Colors.ENDC} Alchemy API: {Colors.GRAY}Not configured{Colors.ENDC}")
+    
+    if TELEGRAM_ENABLED:
+        api_status.append(f"{Colors.GREEN}✓{Colors.ENDC} Telegram Bot: {Colors.GREEN}Enabled{Colors.ENDC}")
+        # Test telegram connection
+        if send_telegram_message("🚀 DIDINSKA Wallet Hunter started!"):
+            api_status.append(f"  {Colors.GREEN}→{Colors.ENDC} Connection test: {Colors.GREEN}Success{Colors.ENDC}")
+        else:
+            api_status.append(f"  {Colors.RED}→{Colors.ENDC} Connection test: {Colors.RED}Failed{Colors.ENDC}")
+    else:
+        api_status.append(f"{Colors.GRAY}✗{Colors.ENDC} Telegram Bot: {Colors.GRAY}Disabled{Colors.ENDC}")
+    
+    print_box("🔌 API STATUS", api_status, Colors.BLUE)
+    
+    # System info
+    system_info = [
+        f"💾 Output File    : {OUTPUT_FILE}",
+        f"📭 Empty File     : {EMPTY_WALLETS_FILE}",
+        f"⚡ Workers        : {cfg.get('concurrent_workers', DEFAULT_WORKERS)}",
+        f"🔍 Mode           : Stealth (save only found)",
+        f"📊 Search Space   : 2^128 combinations (~3.4×10^38)",
+    ]
+    print_box("⚙️  SYSTEM CONFIGURATION", system_info, Colors.MAGENTA)
+    
+    # Security disclaimer
+    disclaimer = [
+        f"{Colors.YELLOW}⚠️  This tool is for RESEARCH and EDUCATIONAL purposes only{Colors.ENDC}",
+        f"{Colors.GRAY}• Probability of finding wallet: ~1 in 2^128 (practically impossible){Colors.ENDC}",
+        f"{Colors.GRAY}• Do not use for illegal purposes{Colors.ENDC}",
+        f"{Colors.GRAY}• Report findings through proper bug bounty channels{Colors.ENDC}",
+        f"{Colors.GRAY}• All data is processed locally - no external data collection{Colors.ENDC}",
+    ]
+    print_box("⚖️  DISCLAIMER", disclaimer, Colors.RED)
+    
     # Run menu
     menu_loop(cfg, web3_clients)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n\n{Colors.YELLOW}[!] Interrupted by user. Exiting gracefully...{Colors.ENDC}")
+        print(f"{Colors.GREEN}[+] Goodbye! 👋{Colors.ENDC}\n")
+    except Exception as e:
+        print(f"\n{Colors.RED}[!] Unexpected error: {e}{Colors.ENDC}")
+        if DEBUG_MODE:
+            import traceback
+            traceback.print_exc()
